@@ -1,0 +1,152 @@
+#!/bin/bash
+
+# Define output directory based on the target
+setup_environment() {
+    local target=$1
+    TARGET_DIR="$HOME/Recon/$target"
+    mkdir -p "$TARGET_DIR"
+    echo "Environment set up at $TARGET_DIR"
+}
+
+collect_domains() {
+    local target=$1
+    local output_file="$TARGET_DIR/${target}.txt"
+    mkdir -p "$TARGET_DIR" # Assurez-vous que le répertoire existe.
+    
+    findomain --target "$target" -u "$output_file"
+    
+    # Attendre que findomain ait fini et vérifier que le fichier existe.
+    if [ ! -f "$output_file" ]; then
+        echo "Le fichier de sous-domaines n'a pas été créé. Vérifiez les permissions et la connectivité réseau."
+        exit 1
+    fi
+
+    echo "Domains collected in $output_file"
+}
+
+# Step 1: Run httpx to analyze the HTTP status of the collected domains
+analyze_http_status() {
+    local domains_file="$TARGET_DIR/${TARGET}.txt"
+    local output_file="$TARGET_DIR/httpx_output.txt"
+    > "$output_file" # Réinitialiser le fichier de sortie
+
+    while IFS= read -r domain; do
+        # Ajouter le protocole https://
+        local full_domain="https://$domain"
+        # Exécuter httpx et vérifier le statut 200
+        if httpx "$full_domain" --no-verify --http2 --follow-redirects | grep -q '200'; then
+            echo "$full_domain" >> "$output_file"
+        fi
+    done < "$domains_file"
+
+    echo "HTTP status analyzed in $output_file"
+}
+
+# Step 2: Run waybackurls on each domain with status 200 and collect URLs in separate files
+collect_waybackurls() {
+    local httpx_output_file="$TARGET_DIR/httpx_output.txt"
+
+    while IFS= read -r domain; do
+     
+
+        # Exécuter waybackurls et stocker les résultats dans une variable
+        local wayback_results=$(waybackurls "$domain")
+
+        # Ignorer si waybackurls ne renvoie rien ou seulement le domaine
+        if [ -z "$wayback_results" ] || (echo "$wayback_results" | grep -qx "$domain"); then
+            continue
+        fi
+
+        # Ignorer si le résultat contient uniquement le domaine de base
+        local line_count=$(echo "$wayback_results" | wc -l)
+        if [ "$line_count" -eq 1 ]; then
+            continue
+        fi
+
+        # Créer un fichier de sortie si waybackurls a renvoyé des URLs valides
+        local domain_name=$(echo "$domain" | cut -d '/' -f3 | sed 's/[^a-zA-Z0-9]/_/g')
+        local output_file="$TARGET_DIR/waybackurls_${domain_name}.txt"
+        echo "$wayback_results" > "$output_file"
+        echo "URLs for $domain collected in $output_file"
+    done < "$httpx_output_file"
+}
+
+
+# Step 3: Extract endpoints from each waybackurls file and save them in a new file
+extract_endpoints() {
+    local waybackurls_dir="$TARGET_DIR"
+
+    for file in "$waybackurls_dir"/waybackurls_*.txt; do
+        local base_name=$(basename "$file" .txt)
+        local domain=$(echo "$base_name" | sed 's/waybackurls_//')
+        local endpoints_file="$waybackurls_dir/${domain}_endpoints.txt"
+
+        # Utiliser cut pour extraire les endpoints
+        cat "$file" | cut -d "/" -f4- > "$endpoints_file"
+
+        # Vérifier si le nouveau fichier d'endpoints contient des données
+        if [ -s "$endpoints_file" ]; then
+            echo "Endpoints for $domain collected in $endpoints_file"
+        else
+            echo "No endpoints found for $domain."
+            rm "$endpoints_file" # Supprimer le fichier d'endpoints vide
+        fi
+
+        # Supprimer le fichier waybackurls original s'il n'est plus nécessaire
+        if [ -e "$endpoints_file" ]; then
+            rm "$file"
+        fi
+    done
+}
+
+
+# Step 4: Use dirsearch on the endpoints
+run_dirsearch() {
+    local endpoints_dir="$TARGET_DIR"
+
+    for file in "$endpoints_dir"/*_endpoints.txt; do
+        local domain=$(basename "$file" _endpoints.txt)
+        local base_url="https://${domain//_/\.}"  # Remplace les underscores par des points
+
+        local output_file="$endpoints_dir/${domain}_dirsearch.txt"
+
+        # Exécutez dirsearch avec le fichier d'endpoints comme wordlist
+        dirsearch -u "$base_url" -w "$file" -o "$output_file"
+
+        # Vérifiez si des résultats ont été trouvés et triez-les si nécessaire
+        if [ -s "$output_file" ]; then
+            # Tri les résultats par code de statut, en supprimant les lignes avec seulement le domaine de base
+            grep -v "^${base_url}$" "$output_file" | sort > "${output_file}_sorted"
+            mv "${output_file}_sorted" "$output_file"  # Remplacez le fichier original par la version triée
+            echo "Dirsearch results for $base_url saved in $output_file"
+        else
+            echo "No results found for $base_url with dirsearch."
+            rm "$output_file"  # Supprimer le fichier de sortie si vide
+        fi
+
+        # Supprimez le fichier d'endpoints après l'exécution de dirsearch
+        rm "$file"
+    done
+
+    echo "Dirsearch process completed. Endpoint files removed."
+}
+
+
+
+
+# Check if a target is provided
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <target>"
+    exit 1
+fi
+
+# Main execution
+TARGET=$1
+setup_environment "$TARGET"
+collect_domains "$TARGET"
+analyze_http_status
+collect_waybackurls
+extract_endpoints
+run_dirsearch
+
+echo "Reconnaissance process for $TARGET completed."
